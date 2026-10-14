@@ -1,6 +1,7 @@
 import * as assert from "assert";
 import { promises as fsp } from "fs";
 
+import { getCommittedFixturesState, getLocalFixtures } from "./fixtures";
 import { isNoTransactionDefined } from "./header";
 import { readFileOrError, readFileOrNull, statOrNull } from "./lib";
 import {
@@ -56,7 +57,46 @@ export async function readCurrentMigration(
   parsedSettings: ParsedSettings,
   location: CurrentMigrationLocation,
 ): Promise<string> {
-  const { body, paths } = await readCurrentMigrationRaw(location);
+  const { body: rawBody, paths } = await readCurrentMigrationRaw(location);
+  let body = rawBody;
+  if (parsedSettings.autoIncludeFixtures) {
+    const regex = /^--![ \t]*include[ \t]+(.*\.sql)[ \t]*$/gm;
+    const alreadyIncluded = [...body.matchAll(regex)].map((match) => match[1]);
+
+    // Find any fixture that has changed since the last commit that hasn't been
+    // specifically `--!include`'d
+    const committedState = await getCommittedFixturesState(parsedSettings);
+    const currentFixtures = await getLocalFixtures(parsedSettings);
+    const changedFixtures: string[] = [];
+    for (const [relativePath, { hash, hasNoTransaction }] of Object.entries(
+      currentFixtures,
+    )) {
+      if (committedState[relativePath] !== hash) {
+        // TODO: maybe be a bit more flexible about matches here: `./`, etc
+        if (!alreadyIncluded.includes(relativePath)) {
+          if (hasNoTransaction) {
+            parsedSettings.logger.warn(
+              `Not including modified fixture ${relativePath} because it includes --! no-transaction`,
+              { relativePath, noTransaction: true },
+            );
+          } else {
+            changedFixtures.push(relativePath);
+          }
+        }
+      }
+    }
+
+    // Prefix the migration with the changed fixture includes
+    if (changedFixtures.length > 0) {
+      changedFixtures.sort((a, z) => (a < z ? -1 : a > z ? 1 : 0));
+      body =
+        changedFixtures
+          .map((relativePath) => `--!include ${relativePath}`)
+          .join("\n") +
+        "\n\n--!endAuto\n\n" +
+        body;
+    }
+  }
   return compileIncludes(parsedSettings, body, new Set(paths));
 }
 
@@ -151,8 +191,10 @@ async function readCurrentMigrationRaw(
 export async function writeCurrentMigration(
   parsedSettings: ParsedSettings,
   location: CurrentMigrationLocation,
-  body: string,
+  rawBody: string,
 ): Promise<void> {
+  // Strip the auto-included fixtures
+  const body = rawBody.replace(/^[\s\S]*\n--!endAuto\n\n/, "");
   if (body.trim() + "\n" !== body) {
     throw new Error(
       "graphile-migrate error - 'body' should be sanitized before being passed to 'writeCurrentMigration'",
